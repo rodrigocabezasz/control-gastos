@@ -1,0 +1,14 @@
+# 1. Iniciar entorno virtual
+.venv\Scripts\activate
+
+# 2. Instalar dependencias
+pip install -r requirements.txt
+
+# 3. Crear archivo .env con tus configuraciones
+# (copiar de .env.example)
+
+# 4. Ejecutar backend
+python run_backend.py
+
+# 5. Ejecutar frontend (en otra terminal)
+python run_frontend.py

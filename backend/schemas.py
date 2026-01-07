@@ -297,6 +297,19 @@ class ReminderWithStatus(Reminder):
         from_attributes = True
 
 
+class MarkReminderPaidRequest(BaseModel):
+    category_id: int = Field(..., description="ID de la categoría para la transacción")
+    payment_date: Optional[date] = Field(default=None, description="Fecha del pago (hoy si no se especifica)")
+
+
+class MarkReminderPaidResponse(BaseModel):
+    reminder: Reminder
+    transaction: 'Transaction'
+    
+    class Config:
+        from_attributes = True
+
+
 # ========== STATISTICS SCHEMAS ==========
 class MonthlyStats(BaseModel):
     month: int
@@ -394,3 +407,91 @@ class BillWithPagos(Bill):
 
     class Config:
         from_attributes = True
+
+
+# ========== IMPORT RULES SCHEMAS ==========
+class ImportRuleBase(BaseModel):
+    category_id: int
+    keyword: str = Field(..., min_length=1, max_length=200)
+    priority: int = Field(default=0, ge=0, le=100)
+    is_active: bool = True
+
+
+class ImportRuleCreate(ImportRuleBase):
+    pass
+
+
+class ImportRuleUpdate(BaseModel):
+    category_id: Optional[int] = None
+    keyword: Optional[str] = Field(None, min_length=1, max_length=200)
+    priority: Optional[int] = Field(None, ge=0, le=100)
+    is_active: Optional[bool] = None
+
+
+class ImportRule(ImportRuleBase):
+    id: int
+    user_id: int
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+# ========== PENDING TRANSACTIONS SCHEMAS ==========
+class PendingTransactionBase(BaseModel):
+    amount: float
+    type: TransactionType
+    description: str
+    date: date
+    raw_description: Optional[str] = None
+
+
+class PendingTransactionCreate(PendingTransactionBase):
+    category_id: Optional[int] = None
+    auto_categorized: bool = False
+    import_batch_id: Optional[str] = None
+
+
+class PendingTransactionUpdate(BaseModel):
+    category_id: Optional[int] = None
+
+
+class PendingTransaction(BaseModel):
+    id: int
+    user_id: int
+    category_id: Optional[int] = None
+    amount: float
+    type: TransactionTypeEnum
+    description: str
+    date: date
+    raw_description: Optional[str] = None
+    is_confirmed: bool
+    auto_categorized: bool
+    import_batch_id: Optional[str] = None
+    created_at: datetime
+    
+    @validator('type', pre=True)
+    def convert_type_from_int(cls, v):
+        """Convertir type de integer (BD) a string (API)"""
+        if isinstance(v, int):
+            return TRANSACTION_TYPE_MAP.get(v, 'gasto')
+        return v
+    
+    class Config:
+        from_attributes = True
+
+
+class ImportSummary(BaseModel):
+    """Resumen de importación"""
+    total_imported: int
+    auto_categorized: int
+    needs_review: int
+    duplicates_skipped: int
+    batch_id: str
+    pending_transactions: List[PendingTransaction]
+
+
+class ConfirmTransactionsRequest(BaseModel):
+    """Request para confirmar transacciones pendientes"""
+    transaction_ids: List[int]
+    category_assignments: Optional[dict] = None  # {transaction_id: category_id}

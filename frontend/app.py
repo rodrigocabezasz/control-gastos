@@ -351,28 +351,245 @@ def dashboard_page():
             fig.update_layout(barmode='group')
             st.plotly_chart(fig, use_container_width=True)
     
-    # Recordatorios próximos
-    st.subheader("🔔 Recordatorios Próximos")
-    reminders = api_get("/reminders/due")
+    # ========== NOTIFICACIONES Y ALERTAS ==========
+    st.divider()
     
-    if reminders:
-        due_reminders = [r for r in reminders if r['is_due'] and r['days_until_due'] >= 0]
+    # Recordatorios próximos
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🔔 Recordatorios Próximos")
+        pending_reminders = api_get("/notifications/pending-reminders?days_ahead=7")
         
-        if due_reminders:
-            for reminder in due_reminders[:5]:  # Mostrar máximo 5
+        if pending_reminders:
+            for reminder in pending_reminders[:5]:  # Mostrar máximo 5
                 days = reminder['days_until_due']
-                if days == 0:
-                    message = "⚠️ **Vence HOY**"
-                elif days == 1:
-                    message = "⏰ Vence mañana"
-                else:
-                    message = f"📅 Vence en {days} días"
                 
-                st.warning(f"{message}: {reminder['name']} - ${reminder['amount']:,.2f}")
+                if days == 0:
+                    icon = "🚨"
+                    color = "error"
+                    message = "Vence HOY"
+                elif days <= 2:
+                    icon = "⚠️"
+                    color = "warning"
+                    message = f"Vence en {days} día{'s' if days > 1 else ''}"
+                else:
+                    icon = "📅"
+                    color = "info"
+                    message = f"Vence en {days} días"
+                
+                with st.container():
+                    st.markdown(f"**{icon} {reminder['name']}** - ${reminder['amount']:,.2f}")
+                    st.caption(f"{message} • {reminder['frequency'].capitalize()}")
         else:
             st.success("✅ No hay pagos pendientes próximos")
+    
+    with col2:
+        st.subheader("⚠️ Alertas de Presupuesto")
+        budget_alerts = api_get("/notifications/budget-alerts")
+        
+        if budget_alerts:
+            for alert in budget_alerts[:5]:  # Mostrar máximo 5
+                percentage = alert['percentage_used']
+                
+                if percentage >= 100:
+                    icon = "🚨"
+                    status_text = f"Excedido por ${abs(alert['remaining']):,.2f}"
+                elif percentage >= 80:
+                    icon = "⚠️"
+                    status_text = f"Quedan ${alert['remaining']:,.2f}"
+                else:
+                    continue  # No mostrar si está por debajo del threshold
+                
+                with st.container():
+                    st.markdown(f"**{icon} {alert['category_icon']} {alert['category_name']}**")
+                    st.progress(min(percentage / 100, 1.0))
+                    st.caption(f"{percentage:.1f}% usado • {status_text}")
+        else:
+            st.info("💚 Todos los presupuestos están bajo control")
+    
+    # ========== TENDENCIAS Y ANÁLISIS ==========
+    st.divider()
+    st.subheader("📈 Tendencias y Análisis")
+    
+    # Obtener datos de tendencias
+    trends = api_get("/stats/trends?months=6")
+    
+    if trends and trends.get('months'):
+        # Crear tabs para diferentes vistas
+        tab_trend1, tab_trend2, tab_trend3 = st.tabs(["📊 Evolución Mensual", "📉 Por Categoría", "🔮 Predicción"])
+        
+        with tab_trend1:
+            # Gráfico de línea: Ingresos vs Gastos
+            fig_trend = go.Figure()
+            
+            fig_trend.add_trace(go.Scatter(
+                x=trends['months'],
+                y=trends['income'],
+                mode='lines+markers',
+                name='Ingresos',
+                line=dict(color='#2ecc71', width=3),
+                marker=dict(size=8)
+            ))
+            
+            fig_trend.add_trace(go.Scatter(
+                x=trends['months'],
+                y=trends['expenses'],
+                mode='lines+markers',
+                name='Gastos',
+                line=dict(color='#e74c3c', width=3),
+                marker=dict(size=8)
+            ))
+            
+            fig_trend.add_trace(go.Scatter(
+                x=trends['months'],
+                y=trends['balance'],
+                mode='lines+markers',
+                name='Balance',
+                line=dict(color='#3498db', width=3, dash='dash'),
+                marker=dict(size=8)
+            ))
+            
+            fig_trend.update_layout(
+                title="Evolución de Ingresos, Gastos y Balance",
+                xaxis_title="Mes",
+                yaxis_title="Monto ($)",
+                hovermode='x unified',
+                height=400
+            )
+            
+            st.plotly_chart(fig_trend, use_container_width=True)
+            
+            # Métricas de tendencia
+            col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+            
+            with col_t1:
+                st.metric(
+                    "📊 Promedio Ingresos",
+                    f"${trends['average']['income']:,.2f}"
+                )
+            
+            with col_t2:
+                st.metric(
+                    "📊 Promedio Gastos",
+                    f"${trends['average']['expenses']:,.2f}"
+                )
+            
+            with col_t3:
+                growth_income = trends['growth_rate']['income']
+                st.metric(
+                    "📈 Crecimiento Ingresos",
+                    f"{growth_income:+.1f}%",
+                    delta=f"{growth_income:+.1f}%"
+                )
+            
+            with col_t4:
+                growth_expenses = trends['growth_rate']['expenses']
+                st.metric(
+                    "📉 Crecimiento Gastos",
+                    f"{growth_expenses:+.1f}%",
+                    delta=f"{growth_expenses:+.1f}%",
+                    delta_color="inverse"
+                )
+        
+        with tab_trend2:
+            # Gráfico de tendencias por categoría
+            if trends['categories_trend']:
+                st.write("**Evolución de gastos por categoría:**")
+                
+                fig_cat_trend = go.Figure()
+                
+                for category, values in trends['categories_trend'].items():
+                    fig_cat_trend.add_trace(go.Scatter(
+                        x=trends['months'],
+                        y=values,
+                        mode='lines+markers',
+                        name=category,
+                        marker=dict(size=6)
+                    ))
+                
+                fig_cat_trend.update_layout(
+                    title="Tendencia de Gastos por Categoría",
+                    xaxis_title="Mes",
+                    yaxis_title="Monto ($)",
+                    hovermode='x unified',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_cat_trend, use_container_width=True)
+            else:
+                st.info("No hay suficientes datos para mostrar tendencias por categoría")
+        
+        with tab_trend3:
+            # Predicción para el próximo mes
+            st.write("**Predicción para el próximo mes (basada en últimos 3 meses):**")
+            
+            col_p1, col_p2, col_p3 = st.columns(3)
+            
+            with col_p1:
+                st.metric(
+                    "💰 Ingresos Estimados",
+                    f"${trends['prediction']['next_month_income']:,.2f}"
+                )
+            
+            with col_p2:
+                st.metric(
+                    "💸 Gastos Estimados",
+                    f"${trends['prediction']['next_month_expenses']:,.2f}"
+                )
+            
+            with col_p3:
+                predicted_balance = trends['prediction']['next_month_balance']
+                st.metric(
+                    "📈 Balance Estimado",
+                    f"${predicted_balance:,.2f}",
+                    delta=f"${predicted_balance:,.2f}",
+                    delta_color="normal" if predicted_balance >= 0 else "inverse"
+                )
+            
+            # Gráfico de predicción
+            months_with_pred = trends['months'] + ["Predicción"]
+            income_with_pred = trends['income'] + [trends['prediction']['next_month_income']]
+            expenses_with_pred = trends['expenses'] + [trends['prediction']['next_month_expenses']]
+            
+            fig_pred = go.Figure()
+            
+            fig_pred.add_trace(go.Scatter(
+                x=months_with_pred,
+                y=income_with_pred,
+                mode='lines+markers',
+                name='Ingresos',
+                line=dict(color='#2ecc71', width=3)
+            ))
+            
+            fig_pred.add_trace(go.Scatter(
+                x=months_with_pred,
+                y=expenses_with_pred,
+                mode='lines+markers',
+                name='Gastos',
+                line=dict(color='#e74c3c', width=3)
+            ))
+            
+            # Marcar la predicción
+            fig_pred.add_vline(
+                x=len(trends['months']) - 0.5,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text="Predicción"
+            )
+            
+            fig_pred.update_layout(
+                title="Proyección del Próximo Mes",
+                xaxis_title="Mes",
+                yaxis_title="Monto ($)",
+                height=400
+            )
+            
+            st.plotly_chart(fig_pred, use_container_width=True)
+            
+            st.info("💡 La predicción se basa en el promedio de los últimos 3 meses. Es una estimación simple que te ayuda a planificar.")
     else:
-        st.info("No hay recordatorios configurados")
+        st.info("📊 No hay suficientes datos históricos para mostrar tendencias. Registra transacciones durante varios meses para ver el análisis.")
 
 
 # ========== TRANSACCIONES ==========
@@ -442,26 +659,41 @@ def view_transactions():
     """Ver lista de transacciones"""
     st.subheader("Historial de Transacciones")
     
-    # Filtros
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        filter_type = st.selectbox(
-            "Tipo",
-            options=["Todos", "Ingresos", "Gastos"],
-            key="filter_type"
-        )
-    
-    with col2:
-        categories = api_get("/categories")
-        cat_options = ["Todas"] + [f"{cat['icon']} {cat['name']}" for cat in categories] if categories else ["Todas"]
-        filter_cat = st.selectbox("Categoría", options=cat_options, key="filter_cat")
-    
-    with col3:
-        start_date = st.date_input("Desde", value=date.today() - timedelta(days=30), key="start_date")
-    
-    with col4:
-        end_date = st.date_input("Hasta", value=date.today(), key="end_date")
+    # ========== FILTROS AVANZADOS ==========
+    with st.expander("🔍 Filtros Avanzados", expanded=True):
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            filter_type = st.selectbox(
+                "Tipo",
+                options=["Todos", "Ingresos", "Gastos"],
+                key="filter_type"
+            )
+        
+        with col2:
+            categories = api_get("/categories")
+            cat_options = ["Todas"] + [f"{cat['icon']} {cat['name']}" for cat in categories] if categories else ["Todas"]
+            filter_cat = st.selectbox("Categoría", options=cat_options, key="filter_cat")
+        
+        with col3:
+            start_date = st.date_input("Desde", value=date.today() - timedelta(days=30), key="start_date")
+        
+        with col4:
+            end_date = st.date_input("Hasta", value=date.today(), key="end_date")
+        
+        # Segunda fila de filtros
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            min_amount = st.number_input("Monto mínimo ($)", min_value=0.0, value=0.0, step=10.0, key="min_amount")
+        
+        with col2:
+            max_amount = st.number_input("Monto máximo ($)", min_value=0.0, value=0.0, step=10.0, key="max_amount")
+            if max_amount == 0.0:
+                max_amount = None
+        
+        with col3:
+            search_text = st.text_input("🔍 Buscar en descripción", placeholder="Escribe para buscar...", key="search_text")
     
     # Construir params
     params = {
@@ -473,10 +705,27 @@ def view_transactions():
     if filter_type != "Todos":
         params["type"] = "ingreso" if filter_type == "Ingresos" else "gasto"
     
+    if filter_cat != "Todas" and categories:
+        selected_cat_name = filter_cat.split(" ", 1)[1] if " " in filter_cat else filter_cat
+        cat = next((c for c in categories if c['name'] == selected_cat_name), None)
+        if cat:
+            params["category_id"] = cat['id']
+    
+    if min_amount > 0:
+        params["min_amount"] = min_amount
+    
+    if max_amount:
+        params["max_amount"] = max_amount
+    
+    if search_text:
+        params["search_text"] = search_text
+    
     # Obtener transacciones
     transactions = api_get("/transactions", params=params)
     
     if transactions:
+        st.success(f"📊 Se encontraron {len(transactions)} transacciones")
+        
         # Crear DataFrame
         df = pd.DataFrame(transactions)
         
@@ -511,11 +760,98 @@ def view_transactions():
             
             st.divider()
         
-        # Exportar a Excel
-        if st.button("📥 Exportar a Excel"):
-            df_export = df.copy()
-            df_export.to_excel("transacciones.xlsx", index=False)
-            st.success("Exportado a transacciones.xlsx")
+        # Botones de exportación
+        st.divider()
+        col_export1, col_export2, col_export3 = st.columns([1, 1, 2])
+        
+        with col_export1:
+            if st.button("📥 Exportar a Excel", use_container_width=True):
+                # Construir URL con parámetros
+                export_url = f"{API_URL}/transactions/export/excel?"
+                
+                if filter_type != "Todos":
+                    export_url += f"type={'ingreso' if filter_type == 'Ingresos' else 'gasto'}&"
+                
+                if filter_cat != "Todas" and categories:
+                    selected_cat_name = filter_cat.split(" ", 1)[1] if " " in filter_cat else filter_cat
+                    cat = next((c for c in categories if c['name'] == selected_cat_name), None)
+                    if cat:
+                        export_url += f"category_id={cat['id']}&"
+                
+                export_url += f"start_date={start_date}&end_date={end_date}"
+                
+                if min_amount > 0:
+                    export_url += f"&min_amount={min_amount}"
+                
+                if max_amount:
+                    export_url += f"&max_amount={max_amount}"
+                
+                if search_text:
+                    export_url += f"&search_text={search_text}"
+                
+                # Hacer request para descargar
+                headers = get_headers()
+                try:
+                    response = requests.get(export_url, headers=headers, timeout=30)
+                    if response.status_code == 200:
+                        filename = f"transacciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                        st.download_button(
+                            label="⬇️ Descargar Excel",
+                            data=response.content,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error("Error al exportar a Excel")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+        
+        with col_export2:
+            if st.button("📥 Exportar a CSV", use_container_width=True):
+                # Construir URL con parámetros
+                export_url = f"{API_URL}/transactions/export/csv?"
+                
+                if filter_type != "Todos":
+                    export_url += f"type={'ingreso' if filter_type == 'Ingresos' else 'gasto'}&"
+                
+                if filter_cat != "Todas" and categories:
+                    selected_cat_name = filter_cat.split(" ", 1)[1] if " " in filter_cat else filter_cat
+                    cat = next((c for c in categories if c['name'] == selected_cat_name), None)
+                    if cat:
+                        export_url += f"category_id={cat['id']}&"
+                
+                export_url += f"start_date={start_date}&end_date={end_date}"
+                
+                if min_amount > 0:
+                    export_url += f"&min_amount={min_amount}"
+                
+                if max_amount:
+                    export_url += f"&max_amount={max_amount}"
+                
+                if search_text:
+                    export_url += f"&search_text={search_text}"
+                
+                # Hacer request para descargar
+                headers = get_headers()
+                try:
+                    response = requests.get(export_url, headers=headers, timeout=30)
+                    if response.status_code == 200:
+                        filename = f"transacciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                        st.download_button(
+                            label="⬇️ Descargar CSV",
+                            data=response.content,
+                            file_name=filename,
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    else:
+                        st.error("Error al exportar a CSV")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+        
+        with col_export3:
+            st.caption("💡 Los archivos exportados incluyen todas las transacciones que coinciden con los filtros aplicados")
     else:
         st.info("No hay transacciones para mostrar")
 
@@ -793,20 +1129,397 @@ def view_reminders():
                         st.write(f"**Descripción:** {reminder['description']}")
                     if reminder['last_paid_date']:
                         st.write(f"**Último pago:** {reminder['last_paid_date']}")
+                    
+                    # Formulario para marcar como pagado
+                    with st.form(key=f"pay_form_{reminder['id']}"):
+                        st.write("**Marcar como pagado:**")
+                        
+                        # Obtener categorías
+                        categories = api_get("/categories")
+                        if categories:
+                            cat_options = {f"{cat['icon']} {cat['name']}": cat['id'] for cat in categories}
+                            selected_cat = st.selectbox(
+                                "Categoría para el gasto", 
+                                options=list(cat_options.keys()),
+                                key=f"cat_{reminder['id']}"
+                            )
+                            
+                            payment_date = st.date_input(
+                                "Fecha de pago",
+                                value=date.today(),
+                                key=f"date_{reminder['id']}"
+                            )
+                            
+                            pay_submit = st.form_submit_button("✅ Marcar como Pagado")
+                            
+                            if pay_submit:
+                                data = {
+                                    "category_id": cat_options[selected_cat],
+                                    "payment_date": str(payment_date)
+                                }
+                                result = api_post(f"/reminders/{reminder['id']}/mark-paid", data)
+                                if result:
+                                    st.success("✅ Marcado como pagado y transacción creada")
+                                    st.rerun()
+                        else:
+                            st.warning("⚠️ Necesitas crear categorías primero")
                 
                 with col2:
-                    if st.button("✅ Marcar Pagado", key=f"pay_{reminder['id']}"):
-                        result = api_post(f"/reminders/{reminder['id']}/mark-paid", {})
-                        if result:
-                            st.success("Marcado como pagado")
-                            st.rerun()
-                    
                     if st.button("🗑️ Eliminar", key=f"del_rem_{reminder['id']}"):
                         if api_delete(f"/reminders/{reminder['id']}"):
                             st.success("Eliminado")
                             st.rerun()
     else:
         st.info("No tienes recordatorios configurados")
+
+
+# ========== IMPORTAR BANCO ==========
+def import_page():
+    """Página de importación de cartolas bancarias"""
+    st.title("🏦 Importar Cartola Bancaria")
+    
+    # Tabs principales
+    tab1, tab2, tab3 = st.tabs(["📤 Importar Excel", "📋 Revisar Pendientes", "⚙️ Reglas de Homologación"])
+    
+    with tab1:
+        import_excel_tab()
+    
+    with tab2:
+        review_pending_tab()
+    
+    with tab3:
+        import_rules_tab()
+
+
+def import_excel_tab():
+    """Tab para importar archivo Excel"""
+    st.subheader("Importar Transacciones desde Excel")
+    
+    # Información sobre el formato
+    with st.expander("ℹ️ Formato del archivo Excel", expanded=False):
+        st.markdown("""
+        **El archivo Excel debe contener las siguientes columnas:**
+        
+        - **Fecha**: Fecha de la transacción (cualquier formato de fecha)
+        - **Descripción**: Descripción o glosa de la transacción
+        - **Cargo**: Monto de los gastos/egresos (opcional si hay columna Abono)
+        - **Abono**: Monto de los ingresos/depósitos (opcional si hay columna Cargo)
+        
+        **Nota:** Los nombres de columnas pueden variar (Fecha/Date, Descripción/Description/Glosa, 
+        Cargo/Debe/Egreso, Abono/Haber/Ingreso). El sistema intentará identificarlas automáticamente.
+        
+        **Ejemplo:**
+        
+        | Fecha | Descripción | Cargo | Abono |
+        |-------|-------------|-------|-------|
+        | 01/01/2026 | SUPERMERCADO ABC | 45000 | |
+        | 02/01/2026 | SUELDO MENSUAL | | 500000 |
+        | 03/01/2026 | FARMACIA XYZ | 12500 | |
+        """)
+    
+    # Upload de archivo
+    uploaded_file = st.file_uploader(
+        "Selecciona tu archivo Excel o CSV de cartola bancaria",
+        type=['xlsx', 'xls', 'csv'],
+        help="Sube el archivo Excel o CSV descargado desde tu banco"
+    )
+    
+    if uploaded_file is not None:
+        st.success(f"✅ Archivo cargado: {uploaded_file.name}")
+        
+        if st.button("🚀 Importar Transacciones", type="primary", use_container_width=True):
+            with st.spinner("Procesando archivo..."):
+                # Preparar archivo para envío
+                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                headers = get_headers()
+                
+                try:
+                    response = requests.post(
+                        f"{API_URL}/transactions/import/excel",
+                        files=files,
+                        headers=headers,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        
+                        st.success("🎉 ¡Importación completada!")
+                        
+                        # Mostrar resumen
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            st.metric(
+                                "📊 Total Importadas",
+                                result['total_imported']
+                            )
+                        
+                        with col2:
+                            st.metric(
+                                "✅ Auto-Categorizadas",
+                                result['auto_categorized']
+                            )
+                        
+                        with col3:
+                            st.metric(
+                                "⚠️ Requieren Revisión",
+                                result['needs_review']
+                            )
+                        
+                        with col4:
+                            st.metric(
+                                "🚫 Duplicadas Omitidas",
+                                result.get('duplicates_skipped', 0)
+                            )
+                        
+                        st.info(f"🔖 ID de lote: {result['batch_id']}")
+                        
+                        if result.get('duplicates_skipped', 0) > 0:
+                            st.info(f"ℹ️ Se omitieron {result['duplicates_skipped']} transacciones duplicadas (misma fecha, monto y descripción)")
+                        
+                        if result['needs_review'] > 0:
+                            st.warning("⚠️ Hay transacciones que requieren asignación de categoría. Ve a la pestaña 'Revisar Pendientes'")
+                        else:
+                            st.success("✅ Todas las transacciones fueron categorizadas automáticamente")
+                        
+                        # Botón para ir a revisar
+                        if st.button("➡️ Ir a Revisar Pendientes"):
+                            st.rerun()
+                        
+                    else:
+                        error_detail = response.json().get('detail', 'Error desconocido')
+                        st.error(f"❌ Error al importar: {error_detail}")
+                        
+                except requests.exceptions.Timeout:
+                    st.error("⏱️ Tiempo de espera agotado. El archivo puede ser muy grande.")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+
+
+def review_pending_tab():
+    """Tab para revisar transacciones pendientes"""
+    st.subheader("Revisar Transacciones Pendientes")
+    
+    # Obtener transacciones pendientes
+    pending = api_get("/transactions/pending")
+    
+    if not pending:
+        st.info("✅ No hay transacciones pendientes de revisión")
+        return
+    
+    st.success(f"📊 Hay {len(pending)} transacciones pendientes")
+    
+    # Obtener categorías para el selector
+    categories = api_get("/categories")
+    if not categories:
+        st.warning("⚠️ Necesitas crear categorías primero")
+        return
+    
+    cat_options = {f"{cat['icon']} {cat['name']}": cat['id'] for cat in categories}
+    
+    # Formulario para asignar categorías
+    with st.form("assign_categories_form"):
+        st.write("**Asigna categorías a las transacciones:**")
+        
+        assignments = {}
+        selected_ids = []
+        
+        for idx, trans in enumerate(pending):
+            col1, col2, col3, col4, col5 = st.columns([1, 2, 1, 2, 1])
+            
+            with col1:
+                select = st.checkbox(
+                    "Seleccionar",
+                    key=f"select_{trans['id']}",
+                    value=True,
+                    label_visibility="collapsed"
+                )
+                if select:
+                    selected_ids.append(trans['id'])
+            
+            with col2:
+                st.write(f"📅 {trans['date']}")
+            
+            with col3:
+                tipo_icon = "💰" if trans['type'] == "ingreso" else "💸"
+                st.write(f"{tipo_icon} ${trans['amount']:,.0f}")
+            
+            with col4:
+                # Mostrar descripción
+                desc = trans['description'][:60] + "..." if len(trans['description']) > 60 else trans['description']
+                if trans['auto_categorized']:
+                    st.write(f"✅ {desc}")
+                else:
+                    st.write(f"⚠️ {desc}")
+            
+            with col5:
+                # Selector de categoría
+                default_cat = None
+                if trans['category_id']:
+                    # Buscar la categoría actual
+                    current_cat = next((c for c in categories if c['id'] == trans['category_id']), None)
+                    if current_cat:
+                        default_cat = f"{current_cat['icon']} {current_cat['name']}"
+                
+                if default_cat and default_cat in cat_options:
+                    default_index = list(cat_options.keys()).index(default_cat)
+                else:
+                    default_index = 0
+                
+                selected_cat = st.selectbox(
+                    "Categoría",
+                    options=list(cat_options.keys()),
+                    key=f"cat_{trans['id']}",
+                    index=default_index,
+                    label_visibility="collapsed"
+                )
+                
+                assignments[str(trans['id'])] = cat_options[selected_cat]
+            
+            st.divider()
+        
+        # Botones de acción
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            confirm_button = st.form_submit_button(
+                f"✅ Confirmar {len(selected_ids)} Seleccionadas",
+                type="primary",
+                use_container_width=True
+            )
+        
+        with col2:
+            delete_button = st.form_submit_button(
+                f"🗑️ Eliminar {len(selected_ids)} Seleccionadas",
+                use_container_width=True
+            )
+        
+        if confirm_button:
+            if selected_ids:
+                data = {
+                    "transaction_ids": selected_ids,
+                    "category_assignments": assignments
+                }
+                
+                result = api_post("/transactions/pending/confirm", data)
+                
+                if result:
+                    st.success(f"✅ {result['confirmed_count']} transacciones confirmadas")
+                    st.rerun()
+            else:
+                st.warning("⚠️ No hay transacciones seleccionadas")
+        
+        if delete_button:
+            if selected_ids:
+                deleted_count = 0
+                for trans_id in selected_ids:
+                    if api_delete(f"/transactions/pending/{trans_id}"):
+                        deleted_count += 1
+                
+                st.success(f"🗑️ {deleted_count} transacciones eliminadas")
+                st.rerun()
+            else:
+                st.warning("⚠️ No hay transacciones seleccionadas")
+
+
+def import_rules_tab():
+    """Tab para gestionar reglas de homologación"""
+    st.subheader("Reglas de Homologación Automática")
+    
+    st.info("""
+    💡 **¿Qué son las reglas de homologación?**
+    
+    Las reglas permiten categorizar automáticamente las transacciones según palabras clave en la descripción.
+    Por ejemplo, si creas una regla con la palabra "supermercado" → categoría "Alimentación",
+    todas las transacciones que contengan "supermercado" en su descripción se asignarán automáticamente
+    a la categoría Alimentación.
+    """)
+    
+    # Tabs para crear y ver reglas
+    tab_create, tab_view = st.tabs(["➕ Nueva Regla", "📋 Mis Reglas"])
+    
+    with tab_create:
+        st.write("**Crear Nueva Regla de Homologación**")
+        
+        categories = api_get("/categories")
+        if not categories:
+            st.warning("⚠️ Necesitas crear categorías primero")
+            return
+        
+        with st.form("create_rule_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                keyword = st.text_input(
+                    "Palabra clave",
+                    placeholder="Ej: supermercado, farmacia, uber",
+                    help="Palabra o frase que debe aparecer en la descripción"
+                )
+                
+                cat_options = {f"{cat['icon']} {cat['name']}": cat['id'] for cat in categories}
+                selected_cat = st.selectbox("Categoría destino", options=list(cat_options.keys()))
+            
+            with col2:
+                priority = st.slider(
+                    "Prioridad",
+                    min_value=0,
+                    max_value=100,
+                    value=50,
+                    help="Mayor prioridad = se aplica primero (útil si hay múltiples coincidencias)"
+                )
+            
+            submit = st.form_submit_button("💾 Crear Regla", use_container_width=True)
+            
+            if submit:
+                if not keyword or keyword.strip() == "":
+                    st.error("⚠️ La palabra clave es obligatoria")
+                else:
+                    data = {
+                        "keyword": keyword.strip().lower(),
+                        "category_id": cat_options[selected_cat],
+                        "priority": priority
+                    }
+                    
+                    result = api_post("/import-rules", data)
+                    if result:
+                        st.success(f"✅ Regla creada: '{keyword}' → {selected_cat}")
+                        st.rerun()
+    
+    with tab_view:
+        st.write("**Reglas Activas**")
+        
+        rules = api_get("/import-rules")
+        
+        if rules:
+            # Agrupar por categoría
+            categories = api_get("/categories")
+            cat_dict = {cat['id']: cat for cat in categories} if categories else {}
+            
+            for rule in rules:
+                cat = cat_dict.get(rule['category_id'])
+                cat_name = f"{cat['icon']} {cat['name']}" if cat else "Categoría desconocida"
+                
+                col1, col2, col3, col4 = st.columns([3, 3, 2, 1])
+                
+                with col1:
+                    st.write(f"🔑 **{rule['keyword']}**")
+                
+                with col2:
+                    st.write(f"→ {cat_name}")
+                
+                with col3:
+                    st.write(f"Prioridad: {rule['priority']}")
+                
+                with col4:
+                    if st.button("🗑️", key=f"del_rule_{rule['id']}"):
+                        if api_delete(f"/import-rules/{rule['id']}"):
+                            st.success("Eliminada")
+                            st.rerun()
+                
+                st.divider()
+        else:
+            st.info("📝 No hay reglas creadas. Crea reglas para automatizar la categorización.")
 
 
 # ========== MAIN ==========
@@ -825,7 +1538,7 @@ def main():
             
             page = st.radio(
                 "Navegación",
-                options=["Dashboard", "Transacciones", "Categorías", "Presupuestos", "Recordatorios"],
+                options=["Dashboard", "Transacciones", "Categorías", "Presupuestos", "Recordatorios", "Importar Banco"],
                 label_visibility="collapsed"
             )
             
@@ -845,6 +1558,8 @@ def main():
             budgets_page()
         elif page == "Recordatorios":
             reminders_page()
+        elif page == "Importar Banco":
+            import_page()
 
 
 if __name__ == "__main__":

@@ -2,12 +2,15 @@
 API FastAPI - Control de Gastos Personales
 Sistema completo con autenticación JWT, gestión de transacciones, presupuestos y recordatorios
 """
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import date, datetime, timedelta
+import io
+import pandas as pd
 
 from . import models, schemas, crud
 from .database import engine, get_db
@@ -196,12 +199,15 @@ def get_transactions(
     type: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    search_text: Optional[str] = None,
     skip: int = 0,
     limit: int = 100,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Obtener transacciones con filtros opcionales"""
+    """Obtener transacciones con filtros avanzados"""
     return crud.get_transactions(
         db,
         current_user.id,
@@ -209,6 +215,9 @@ def get_transactions(
         type=type,
         start_date=start_date,
         end_date=end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        search_text=search_text,
         skip=skip,
         limit=limit
     )
@@ -228,6 +237,100 @@ def create_transaction(
     
     return crud.create_transaction(db, transaction, current_user.id)
 
+
+# ========== IMPORT / PENDING TRANSACTIONS ENDPOINTS (deben ir antes de /transactions/{transaction_id}) ==========
+
+@app.get("/transactions/pending", response_model=List[schemas.PendingTransaction], tags=["Import"])
+def get_pending_transactions(
+    batch_id: Optional[str] = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Obtener transacciones pendientes de confirmación"""
+    return crud.get_pending_transactions(db, current_user.id, batch_id)
+
+
+@app.put("/transactions/pending/{transaction_id}", response_model=schemas.PendingTransaction, tags=["Import"])
+def update_pending_transaction_category(
+    transaction_id: int,
+    update: schemas.PendingTransactionUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Actualizar categoría de transacción pendiente"""
+    updated = crud.update_pending_transaction_category(
+        db, transaction_id, update.category_id, current_user.id
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Transacción pendiente no encontrada")
+    return updated
+
+
+@app.post("/transactions/pending/confirm", tags=["Import"])
+def confirm_pending_transactions(
+    request: schemas.ConfirmTransactionsRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Confirmar transacciones pendientes y convertirlas en transacciones reales"""
+    confirmed = crud.confirm_pending_transactions(
+        db,
+        request.transaction_ids,
+        current_user.id,
+        request.category_assignments
+    )
+    
+    return {
+        "message": f"Se confirmaron {confirmed} transacciones",
+        "confirmed_count": confirmed
+    }
+
+
+@app.delete("/transactions/pending/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Import"])
+def delete_pending_transaction(
+    transaction_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Eliminar transacción pendiente"""
+    success = crud.delete_pending_transaction(db, transaction_id, current_user.id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Transacción pendiente no encontrada")
+
+
+@app.post("/transactions/import/excel", response_model=schemas.ImportSummary, tags=["Import"])
+async def import_transactions_from_excel(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Importar transacciones desde archivo Excel o CSV de banco.
+    Formato esperado: Fecha | Descripción | Cargo | Abono
+    """
+    # Validar tipo de archivo
+    if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo debe ser formato Excel (.xlsx, .xls) o CSV (.csv)"
+        )
+    
+    try:
+        # Leer contenido del archivo
+        content = await file.read()
+        
+        # Parsear y crear transacciones pendientes
+        result = crud.parse_bank_excel(content, current_user.id, db)
+        
+        return result
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar archivo: {str(e)}")
+
+
+# ========== TRANSACTION ENDPOINTS ==========
 
 @app.get("/transactions/{transaction_id}", response_model=schemas.Transaction, tags=["Transactions"])
 def get_transaction(
@@ -266,6 +369,147 @@ def delete_transaction(
     success = crud.delete_transaction(db, transaction_id, current_user.id)
     if not success:
         raise HTTPException(status_code=404, detail="Transacción no encontrada")
+
+
+@app.get("/transactions/export/excel", tags=["Transactions", "Export"])
+def export_transactions_excel(
+    category_id: Optional[int] = None,
+    type: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    search_text: Optional[str] = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Exportar transacciones a Excel con los filtros aplicados"""
+    # Obtener transacciones con filtros
+    transactions = crud.get_transactions(
+        db,
+        current_user.id,
+        category_id=category_id,
+        type=type,
+        start_date=start_date,
+        end_date=end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        search_text=search_text,
+        limit=10000  # Aumentar límite para exportación
+    )
+    
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No hay transacciones para exportar")
+    
+    # Convertir a DataFrame
+    data = []
+    for t in transactions:
+        # Obtener categoría
+        category = db.query(models.Category).filter(models.Category.id == t.category_id).first()
+        
+        data.append({
+            "ID": t.id,
+            "Fecha": t.date,
+            "Tipo": "Ingreso" if t.type == 1 else "Gasto",
+            "Categoría": category.name if category else "N/A",
+            "Monto": t.amount,
+            "Descripción": t.description,
+            "Creado": t.created_at.strftime("%Y-%m-%d %H:%M")
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Crear Excel en memoria
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Transacciones', index=False)
+        
+        # Ajustar ancho de columnas
+        worksheet = writer.sheets['Transacciones']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    output.seek(0)
+    
+    # Generar nombre de archivo
+    filename = f"transacciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@app.get("/transactions/export/csv", tags=["Transactions", "Export"])
+def export_transactions_csv(
+    category_id: Optional[int] = None,
+    type: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    search_text: Optional[str] = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Exportar transacciones a CSV con los filtros aplicados"""
+    # Obtener transacciones con filtros
+    transactions = crud.get_transactions(
+        db,
+        current_user.id,
+        category_id=category_id,
+        type=type,
+        start_date=start_date,
+        end_date=end_date,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        search_text=search_text,
+        limit=10000
+    )
+    
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No hay transacciones para exportar")
+    
+    # Convertir a DataFrame
+    data = []
+    for t in transactions:
+        category = db.query(models.Category).filter(models.Category.id == t.category_id).first()
+        
+        data.append({
+            "ID": t.id,
+            "Fecha": t.date,
+            "Tipo": "Ingreso" if t.type == 1 else "Gasto",
+            "Categoría": category.name if category else "N/A",
+            "Monto": t.amount,
+            "Descripción": t.description,
+            "Creado": t.created_at.strftime("%Y-%m-%d %H:%M")
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Crear CSV en memoria
+    output = io.StringIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig')  # utf-8-sig para Excel en español
+    output.seek(0)
+    
+    # Generar nombre de archivo
+    filename = f"transacciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 # ========== BUDGETS ==========
@@ -416,21 +660,33 @@ def update_reminder(
     return updated
 
 
-@app.post("/reminders/{reminder_id}/mark-paid", response_model=schemas.Reminder, tags=["Reminders"])
+@app.post("/reminders/{reminder_id}/mark-paid", response_model=schemas.MarkReminderPaidResponse, tags=["Reminders"])
 def mark_reminder_paid(
     reminder_id: int,
-    paid_date: date = None,
+    request: schemas.MarkReminderPaidRequest,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Marcar recordatorio como pagado"""
-    if paid_date is None:
-        paid_date = date.today()
+    """Marcar recordatorio como pagado y crear transacción automática"""
+    payment_date = request.payment_date if request.payment_date else date.today()
     
-    updated = crud.mark_reminder_as_paid(db, reminder_id, current_user.id, paid_date)
-    if not updated:
+    # Verificar que la categoría pertenece al usuario
+    category = crud.get_category(db, request.category_id, current_user.id)
+    if not category:
+        raise HTTPException(status_code=404, detail="Categoría no encontrada")
+    
+    reminder, transaction = crud.mark_reminder_as_paid(
+        db, 
+        reminder_id, 
+        current_user.id, 
+        payment_date,
+        request.category_id
+    )
+    
+    if not reminder:
         raise HTTPException(status_code=404, detail="Recordatorio no encontrado")
-    return updated
+    
+    return {"reminder": reminder, "transaction": transaction}
 
 
 @app.delete("/reminders/{reminder_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Reminders"])
@@ -443,6 +699,34 @@ def delete_reminder(
     success = crud.delete_reminder(db, reminder_id, current_user.id)
     if not success:
         raise HTTPException(status_code=404, detail="Recordatorio no encontrado")
+
+
+# ========== NOTIFICATIONS & ALERTS ==========
+@app.get("/notifications/pending-reminders", tags=["Notifications"])
+def get_pending_reminders(
+    days_ahead: int = Query(default=7, ge=1, le=30, description="Días hacia adelante para buscar recordatorios"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Obtener recordatorios próximos a vencer"""
+    return crud.get_pending_reminders(db, current_user.id, days_ahead)
+
+
+@app.get("/notifications/budget-alerts", tags=["Notifications"])
+def get_budget_alerts(
+    month: Optional[int] = Query(default=None, ge=1, le=12),
+    year: Optional[int] = Query(default=None, ge=2020, le=2100),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Obtener alertas de presupuestos excedidos o cerca del límite"""
+    # Si no se especifica mes/año, usar el actual
+    if not month or not year:
+        today = date.today()
+        month = today.month
+        year = today.year
+    
+    return crud.get_budget_alerts(db, current_user.id, month, year)
 
 
 # ========== STATISTICS ==========
@@ -467,6 +751,68 @@ def get_current_month_stats(
     return crud.get_monthly_summary(db, current_user.id, today.month, today.year)
 
 
+@app.get("/stats/trends", tags=["Statistics"])
+def get_trends(
+    months: int = Query(default=6, ge=3, le=12, description="Número de meses históricos"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Obtener tendencias de gastos e ingresos de los últimos N meses"""
+    return crud.get_spending_trends(db, current_user.id, months)
+
+
+# ========== IMPORT RULES ==========
+@app.get("/import-rules", response_model=List[schemas.ImportRule], tags=["Import"])
+def get_import_rules(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Obtener todas las reglas de importación del usuario"""
+    return crud.get_import_rules(db, current_user.id)
+
+
+@app.post("/import-rules", response_model=schemas.ImportRule, status_code=status.HTTP_201_CREATED, tags=["Import"])
+def create_import_rule(
+    rule: schemas.ImportRuleCreate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Crear nueva regla de importación"""
+    # Verificar que la categoría pertenece al usuario
+    category = crud.get_category(db, rule.category_id, current_user.id)
+    if not category:
+        raise HTTPException(status_code=404, detail="Categoría no encontrada")
+    
+    return crud.create_import_rule(db, rule, current_user.id)
+
+
+@app.put("/import-rules/{rule_id}", response_model=schemas.ImportRule, tags=["Import"])
+def update_import_rule(
+    rule_id: int,
+    rule: schemas.ImportRuleUpdate,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Actualizar regla de importación"""
+    updated = crud.update_import_rule(db, rule_id, rule, current_user.id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Regla no encontrada")
+    return updated
+
+
+@app.delete("/import-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Import"])
+def delete_import_rule(
+    rule_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Eliminar regla de importación"""
+    success = crud.delete_import_rule(db, rule_id, current_user.id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Regla no encontrada")
+
+
+# ========== BANK IMPORT ==========
 # ========== LEGACY ENDPOINTS (mantener compatibilidad) ==========
 @app.post("/bills", response_model=schemas.Bill, status_code=201, tags=["Legacy"])
 def crear_bill(bill: schemas.BillCreate, db: Session = Depends(get_db)):

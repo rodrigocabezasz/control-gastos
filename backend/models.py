@@ -135,3 +135,42 @@ class Reminder(Base):
     
     # Relaciones
     user = relationship("User", back_populates="reminders")
+
+
+class ImportRule(Base):
+    """Reglas de homologación para importación automática"""
+    __tablename__ = "import_rules"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    category_id = Column(Integer, ForeignKey("categories.id"), nullable=False)
+    keyword = Column(String, nullable=False, index=True)  # Palabra clave a buscar
+    priority = Column(Integer, default=0)  # Mayor prioridad = se aplica primero
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relaciones
+    user = relationship("User")
+    category = relationship("Category")
+
+
+class PendingTransaction(Base):
+    """Transacciones importadas pendientes de confirmación"""
+    __tablename__ = "pending_transactions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    category_id = Column(Integer, ForeignKey("categories.id"), nullable=True)  # Puede ser null si no se auto-asignó
+    amount = Column(Float, nullable=False)
+    type = Column(Integer, nullable=False)  # 1=ingreso, 2=gasto
+    description = Column(Text, nullable=False)
+    date = Column(Date, nullable=False)
+    raw_description = Column(Text)  # Descripción original del banco
+    is_confirmed = Column(Boolean, default=False)
+    auto_categorized = Column(Boolean, default=False)  # Si fue categorizada automáticamente
+    import_batch_id = Column(String)  # ID del lote de importación
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relaciones
+    user = relationship("User")
+    category = relationship("Category")

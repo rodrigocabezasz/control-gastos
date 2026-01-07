@@ -155,10 +155,13 @@ def get_transactions(
     type: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    min_amount: Optional[float] = None,
+    max_amount: Optional[float] = None,
+    search_text: Optional[str] = None,
     skip: int = 0,
     limit: int = 100
 ) -> List[models.Transaction]:
-    """Obtener transacciones con filtros"""
+    """Obtener transacciones con filtros avanzados"""
     query = db.query(models.Transaction).filter(models.Transaction.user_id == user_id)
     
     if category_id:
@@ -172,6 +175,15 @@ def get_transactions(
     
     if end_date:
         query = query.filter(models.Transaction.date <= end_date)
+    
+    if min_amount is not None:
+        query = query.filter(models.Transaction.amount >= min_amount)
+    
+    if max_amount is not None:
+        query = query.filter(models.Transaction.amount <= max_amount)
+    
+    if search_text:
+        query = query.filter(models.Transaction.description.ilike(f"%{search_text}%"))
     
     return query.order_by(models.Transaction.date.desc()).offset(skip).limit(limit).all()
 
@@ -611,3 +623,698 @@ def get_presupuestos(db: Session, mes: Optional[int] = None, anio: Optional[int]
         query = query.filter(models.Presupuesto.anio == anio)
     
     return query.all()
+
+
+# ========== NOTIFICATION & ALERTS ==========
+def get_pending_reminders(db: Session, user_id: int, days_ahead: int = 7) -> List[dict]:
+    """Obtener recordatorios próximos a vencer"""
+    today = date.today()
+    reminders = db.query(models.Reminder).filter(
+        models.Reminder.user_id == user_id,
+        models.Reminder.is_active == True
+    ).all()
+    
+    pending = []
+    for reminder in reminders:
+        # Calcular próxima fecha de vencimiento
+        current_month = today.month
+        current_year = today.year
+        
+        # Si el día ya pasó este mes, calcular para el próximo periodo
+        if today.day > reminder.due_day:
+            if reminder.frequency == 1:  # mensual
+                current_month += 1
+                if current_month > 12:
+                    current_month = 1
+                    current_year += 1
+        
+        # Crear fecha de vencimiento
+        try:
+            due_date = date(current_year, current_month, reminder.due_day)
+        except ValueError:
+            # Si el día no existe en el mes (ej: 31 en febrero), usar último día del mes
+            last_day = calendar.monthrange(current_year, current_month)[1]
+            due_date = date(current_year, current_month, last_day)
+        
+        # Verificar si está dentro del rango de días
+        days_until_due = (due_date - today).days
+        
+        if 0 <= days_until_due <= days_ahead:
+            # Verificar si ya fue pagado este periodo
+            if reminder.last_paid_date:
+                # Si ya se pagó después de la fecha de vencimiento, no mostrar
+                if reminder.last_paid_date >= due_date:
+                    continue
+            
+            pending.append({
+                "reminder_id": reminder.id,
+                "name": reminder.name,
+                "amount": reminder.amount,
+                "due_date": due_date,
+                "days_until_due": days_until_due,
+                "frequency": models.FREQUENCY_MAP.get(reminder.frequency, "desconocido")
+            })
+    
+    return sorted(pending, key=lambda x: x["days_until_due"])
+
+
+def get_budget_alerts(db: Session, user_id: int, month: int, year: int) -> List[dict]:
+    """Obtener alertas de presupuestos excedidos o cerca del límite"""
+    budgets = db.query(models.Budget).filter(
+        models.Budget.user_id == user_id,
+        models.Budget.month == month,
+        models.Budget.year == year
+    ).all()
+    
+    alerts = []
+    for budget in budgets:
+        # Calcular gasto actual de la categoría en el mes
+        total_spent = db.query(func.sum(models.Transaction.amount)).filter(
+            models.Transaction.user_id == user_id,
+            models.Transaction.category_id == budget.category_id,
+            models.Transaction.type == 2,  # gastos
+            extract('month', models.Transaction.date) == month,
+            extract('year', models.Transaction.date) == year
+        ).scalar() or 0
+        
+        # Calcular porcentaje usado
+        percentage_used = (total_spent / budget.amount * 100) if budget.amount > 0 else 0
+        
+        # Crear alerta si supera el threshold o el 100%
+        if percentage_used >= (budget.alert_threshold * 100):
+            category = db.query(models.Category).filter(models.Category.id == budget.category_id).first()
+            
+            status = "warning" if percentage_used < 100 else "danger"
+            
+            alerts.append({
+                "budget_id": budget.id,
+                "category_name": category.name if category else "Desconocido",
+                "category_icon": category.icon if category else "📦",
+                "budget_amount": budget.amount,
+                "spent_amount": total_spent,
+                "percentage_used": round(percentage_used, 1),
+                "remaining": budget.amount - total_spent,
+                "status": status
+            })
+    
+    return sorted(alerts, key=lambda x: x["percentage_used"], reverse=True)
+
+
+def mark_reminder_as_paid(
+    db: Session,
+    reminder_id: int,
+    user_id: int,
+    payment_date: date,
+    category_id: int
+) -> tuple[models.Reminder, models.Transaction]:
+    """Marcar recordatorio como pagado y crear transacción automática"""
+    # Obtener recordatorio
+    reminder = db.query(models.Reminder).filter(
+        models.Reminder.id == reminder_id,
+        models.Reminder.user_id == user_id
+    ).first()
+    
+    if not reminder:
+        return None, None
+    
+    # Actualizar fecha de último pago
+    reminder.last_paid_date = payment_date
+    
+    # Crear transacción automática
+    transaction = models.Transaction(
+        user_id=user_id,
+        category_id=category_id,
+        amount=reminder.amount,
+        type=2,  # gasto
+        description=f"Pago de {reminder.name} (automático desde recordatorio)",
+        date=payment_date
+    )
+    
+    db.add(transaction)
+    db.commit()
+    db.refresh(reminder)
+    db.refresh(transaction)
+    
+    return reminder, transaction
+
+
+# ========== TRENDS & ANALYTICS ==========
+def get_spending_trends(db: Session, user_id: int, months: int = 6) -> dict:
+    """Obtener tendencias de gastos e ingresos de los últimos N meses"""
+    today = date.today()
+    trends_data = {
+        "months": [],
+        "income": [],
+        "expenses": [],
+        "balance": [],
+        "categories_trend": {},
+        "growth_rate": {
+            "income": 0,
+            "expenses": 0
+        },
+        "average": {
+            "income": 0,
+            "expenses": 0,
+            "balance": 0
+        },
+        "prediction": {
+            "next_month_income": 0,
+            "next_month_expenses": 0,
+            "next_month_balance": 0
+        }
+    }
+    
+    # Calcular datos para cada mes
+    for i in range(months - 1, -1, -1):
+        # Calcular mes y año
+        target_month = today.month - i
+        target_year = today.year
+        
+        while target_month <= 0:
+            target_month += 12
+            target_year -= 1
+        
+        # Obtener transacciones del mes
+        total_income = db.query(func.sum(models.Transaction.amount)).filter(
+            models.Transaction.user_id == user_id,
+            models.Transaction.type == 1,  # ingreso
+            extract('month', models.Transaction.date) == target_month,
+            extract('year', models.Transaction.date) == target_year
+        ).scalar() or 0
+        
+        total_expenses = db.query(func.sum(models.Transaction.amount)).filter(
+            models.Transaction.user_id == user_id,
+            models.Transaction.type == 2,  # gasto
+            extract('month', models.Transaction.date) == target_month,
+            extract('year', models.Transaction.date) == target_year
+        ).scalar() or 0
+        
+        balance = total_income - total_expenses
+        
+        # Agregar a listas
+        month_name = calendar.month_name[target_month][:3]  # Ene, Feb, Mar...
+        trends_data["months"].append(f"{month_name} {target_year}")
+        trends_data["income"].append(float(total_income))
+        trends_data["expenses"].append(float(total_expenses))
+        trends_data["balance"].append(float(balance))
+        
+        # Gastos por categoría del mes
+        categories = db.query(
+            models.Category.name,
+            func.sum(models.Transaction.amount).label('total')
+        ).join(
+            models.Transaction,
+            models.Transaction.category_id == models.Category.id
+        ).filter(
+            models.Transaction.user_id == user_id,
+            models.Transaction.type == 2,  # gastos
+            extract('month', models.Transaction.date) == target_month,
+            extract('year', models.Transaction.date) == target_year
+        ).group_by(models.Category.name).all()
+        
+        for cat_name, cat_total in categories:
+            if cat_name not in trends_data["categories_trend"]:
+                trends_data["categories_trend"][cat_name] = []
+            trends_data["categories_trend"][cat_name].append(float(cat_total))
+    
+    # Calcular promedios
+    if trends_data["income"]:
+        trends_data["average"]["income"] = sum(trends_data["income"]) / len(trends_data["income"])
+        trends_data["average"]["expenses"] = sum(trends_data["expenses"]) / len(trends_data["expenses"])
+        trends_data["average"]["balance"] = sum(trends_data["balance"]) / len(trends_data["balance"])
+    
+    # Calcular tasa de crecimiento (comparando primer y último mes)
+    if len(trends_data["income"]) >= 2:
+        if trends_data["income"][0] > 0:
+            income_growth = ((trends_data["income"][-1] - trends_data["income"][0]) / trends_data["income"][0]) * 100
+            trends_data["growth_rate"]["income"] = round(income_growth, 1)
+        
+        if trends_data["expenses"][0] > 0:
+            expenses_growth = ((trends_data["expenses"][-1] - trends_data["expenses"][0]) / trends_data["expenses"][0]) * 100
+            trends_data["growth_rate"]["expenses"] = round(expenses_growth, 1)
+    
+    # Predicción simple (promedio de últimos 3 meses)
+    if len(trends_data["income"]) >= 3:
+        recent_income = trends_data["income"][-3:]
+        recent_expenses = trends_data["expenses"][-3:]
+        
+        trends_data["prediction"]["next_month_income"] = sum(recent_income) / len(recent_income)
+        trends_data["prediction"]["next_month_expenses"] = sum(recent_expenses) / len(recent_expenses)
+        trends_data["prediction"]["next_month_balance"] = (
+            trends_data["prediction"]["next_month_income"] - 
+            trends_data["prediction"]["next_month_expenses"]
+        )
+    
+    return trends_data
+
+
+# ========== IMPORT RULES CRUD ==========
+def get_import_rules(db: Session, user_id: int) -> List[models.ImportRule]:
+    """Obtener todas las reglas de importación del usuario"""
+    return db.query(models.ImportRule).filter(
+        models.ImportRule.user_id == user_id,
+        models.ImportRule.is_active == True
+    ).order_by(models.ImportRule.priority.desc()).all()
+
+
+def create_import_rule(db: Session, rule: schemas.ImportRuleCreate, user_id: int) -> models.ImportRule:
+    """Crear nueva regla de importación"""
+    db_rule = models.ImportRule(
+        **rule.model_dump(),
+        user_id=user_id
+    )
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def update_import_rule(db: Session, rule_id: int, rule: schemas.ImportRuleUpdate, user_id: int) -> Optional[models.ImportRule]:
+    """Actualizar regla de importación"""
+    db_rule = db.query(models.ImportRule).filter(
+        models.ImportRule.id == rule_id,
+        models.ImportRule.user_id == user_id
+    ).first()
+    
+    if not db_rule:
+        return None
+    
+    for key, value in rule.model_dump(exclude_unset=True).items():
+        setattr(db_rule, key, value)
+    
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def delete_import_rule(db: Session, rule_id: int, user_id: int) -> bool:
+    """Eliminar regla de importación"""
+    db_rule = db.query(models.ImportRule).filter(
+        models.ImportRule.id == rule_id,
+        models.ImportRule.user_id == user_id
+    ).first()
+    
+    if not db_rule:
+        return False
+    
+    db.delete(db_rule)
+    db.commit()
+    return True
+
+
+def apply_import_rules(db: Session, user_id: int, description: str) -> Optional[int]:
+    """Aplicar reglas de importación para auto-categorizar basado en descripción"""
+    # Obtener reglas ordenadas por prioridad
+    rules = get_import_rules(db, user_id)
+    
+    # Buscar coincidencia
+    description_lower = description.lower()
+    for rule in rules:
+        if rule.keyword.lower() in description_lower:
+            return rule.category_id
+    
+    return None
+
+
+# ========== PENDING TRANSACTIONS CRUD ==========
+def get_pending_transactions(db: Session, user_id: int, batch_id: Optional[str] = None) -> List[models.PendingTransaction]:
+    """Obtener transacciones pendientes de confirmación"""
+    query = db.query(models.PendingTransaction).filter(
+        models.PendingTransaction.user_id == user_id,
+        models.PendingTransaction.is_confirmed == False
+    )
+    
+    if batch_id:
+        query = query.filter(models.PendingTransaction.import_batch_id == batch_id)
+    
+    return query.order_by(models.PendingTransaction.date.desc()).all()
+
+
+def create_pending_transaction(
+    db: Session, 
+    transaction: schemas.PendingTransactionCreate, 
+    user_id: int
+) -> models.PendingTransaction:
+    """Crear transacción pendiente"""
+    db_transaction = models.PendingTransaction(
+        **transaction.model_dump(),
+        user_id=user_id
+    )
+    db.add(db_transaction)
+    db.commit()
+    db.refresh(db_transaction)
+    return db_transaction
+
+
+def update_pending_transaction_category(
+    db: Session, 
+    transaction_id: int, 
+    category_id: int, 
+    user_id: int
+) -> Optional[models.PendingTransaction]:
+    """Actualizar categoría de transacción pendiente"""
+    db_transaction = db.query(models.PendingTransaction).filter(
+        models.PendingTransaction.id == transaction_id,
+        models.PendingTransaction.user_id == user_id,
+        models.PendingTransaction.is_confirmed == False
+    ).first()
+    
+    if not db_transaction:
+        return None
+    
+    db_transaction.category_id = category_id
+    db.commit()
+    db.refresh(db_transaction)
+    return db_transaction
+
+
+def confirm_pending_transactions(
+    db: Session, 
+    transaction_ids: List[int], 
+    user_id: int,
+    category_assignments: Optional[dict] = None
+) -> int:
+    """Confirmar transacciones pendientes y convertirlas en transacciones reales"""
+    confirmed_count = 0
+    
+    for trans_id in transaction_ids:
+        # Obtener transacción pendiente
+        pending = db.query(models.PendingTransaction).filter(
+            models.PendingTransaction.id == trans_id,
+            models.PendingTransaction.user_id == user_id,
+            models.PendingTransaction.is_confirmed == False
+        ).first()
+        
+        if not pending:
+            continue
+        
+        # Aplicar asignación de categoría si se proporcionó
+        if category_assignments and str(trans_id) in category_assignments:
+            pending.category_id = category_assignments[str(trans_id)]
+        
+        # Verificar que tenga categoría
+        if not pending.category_id:
+            continue
+        
+        # Crear transacción real
+        transaction = models.Transaction(
+            user_id=user_id,
+            category_id=pending.category_id,
+            amount=pending.amount,
+            type=pending.type,
+            description=pending.description,
+            date=pending.date
+        )
+        
+        db.add(transaction)
+        
+        # Marcar como confirmada
+        pending.is_confirmed = True
+        
+        confirmed_count += 1
+    
+    db.commit()
+    return confirmed_count
+
+
+def delete_pending_transaction(db: Session, transaction_id: int, user_id: int) -> bool:
+    """Eliminar transacción pendiente"""
+    db_transaction = db.query(models.PendingTransaction).filter(
+        models.PendingTransaction.id == transaction_id,
+        models.PendingTransaction.user_id == user_id
+    ).first()
+    
+    if not db_transaction:
+        return False
+    
+    db.delete(db_transaction)
+    db.commit()
+    return True
+
+
+def parse_bank_excel(file_content: bytes, user_id: int, db: Session) -> dict:
+    """
+    Parsear archivo Excel o CSV de banco y crear transacciones pendientes
+    Formato esperado: Fecha | Descripción | Cargo/Abono
+    """
+    import pandas as pd
+    from io import BytesIO
+    import uuid
+    
+    # Generar ID de lote
+    batch_id = str(uuid.uuid4())[:8]
+    
+    # Intentar leer como Excel primero, luego como CSV
+    df = None
+    try:
+        df = pd.read_excel(BytesIO(file_content))
+    except:
+        # Intentar leer como CSV con diferentes configuraciones
+        for sep in [';', ',', '\t']:  # Probar diferentes separadores
+            for encoding in ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']:
+                try:
+                    # Reiniciar BytesIO para cada intento
+                    content_io = BytesIO(file_content)
+                    
+                    # Leer todo el archivo para buscar la fila de encabezado
+                    df_test = pd.read_csv(content_io, sep=sep, encoding=encoding, header=None)
+                    
+                    # Buscar fila que contenga "Fecha" (columna de encabezado típica)
+                    header_row = None
+                    for idx, row in df_test.iterrows():
+                        row_str = ' '.join(str(cell).lower() for cell in row if pd.notna(cell))
+                        if 'fecha' in row_str and ('descripción' in row_str or 'descripcion' in row_str or 'detalle' in row_str):
+                            header_row = idx
+                            break
+                    
+                    if header_row is not None:
+                        # Leer nuevamente usando la fila correcta como encabezado
+                        content_io = BytesIO(file_content)  # Reiniciar nuevamente
+                        df = pd.read_csv(content_io, sep=sep, encoding=encoding, header=header_row)
+                        break
+                except:
+                    continue
+            
+            if df is not None:
+                break
+    
+    if df is None or df.empty:
+        raise ValueError("No se pudo leer el archivo. Verifica el formato.")
+    
+    # Normalizar nombres de columnas
+    df.columns = df.columns.str.strip()
+    
+    # Crear versión lowercase para comparación
+    cols_lower = {col: col.lower() for col in df.columns}
+    
+    # Intentar identificar columnas (flexible para diferentes formatos)
+    date_col = None
+    desc_col = None
+    cargo_col = None
+    abono_col = None
+    
+    for col, col_lower in cols_lower.items():
+        if any(word in col_lower for word in ['fecha', 'date']):
+            date_col = col
+        elif any(word in col_lower for word in ['descripción', 'descripcion', 'description', 'detalle', 'glosa']):
+            desc_col = col
+        elif any(word in col_lower for word in ['cargo', 'cargos', 'debe', 'egreso', 'gasto']):
+            cargo_col = col
+        elif any(word in col_lower for word in ['abono', 'abonos', 'haber', 'ingreso', 'deposito', 'depósito']):
+            abono_col = col
+    
+    if not date_col:
+        raise ValueError(f"No se encontró columna de fecha. Columnas disponibles: {', '.join(df.columns)}")
+    
+    if not desc_col:
+        raise ValueError(f"No se encontró columna de descripción. Columnas disponibles: {', '.join(df.columns)}")
+    
+    if not cargo_col and not abono_col:
+        raise ValueError(f"No se encontraron columnas de Cargo/Abono. Columnas disponibles: {', '.join(df.columns)}")
+    
+    total_imported = 0
+    duplicates_skipped = 0
+    auto_categorized = 0
+    pending_transactions = []
+    errors = []
+    
+    for idx, row in df.iterrows():
+        try:
+            # Extraer fecha
+            fecha_raw = row[date_col]
+            if pd.isna(fecha_raw):
+                continue
+            
+            # Intentar parsear fecha con diferentes formatos
+            fecha = None
+            fecha_str = str(fecha_raw).strip()
+            
+            # Mapeo de meses en español
+            meses_es = {
+                'ene': '01', 'enero': '01',
+                'feb': '02', 'febrero': '02',
+                'mar': '03', 'marzo': '03',
+                'abr': '04', 'abril': '04',
+                'may': '05', 'mayo': '05',
+                'jun': '06', 'junio': '06',
+                'jul': '07', 'julio': '07',
+                'ago': '08', 'agosto': '08',
+                'sep': '09', 'septiembre': '09',
+                'oct': '10', 'octubre': '10',
+                'nov': '11', 'noviembre': '11',
+                'dic': '12', 'diciembre': '12'
+            }
+            
+            # Si tiene formato "02/Ene" o similar
+            if '/' in fecha_str and any(mes in fecha_str.lower() for mes in meses_es.keys()):
+                from datetime import datetime
+                parts = fecha_str.split('/')
+                if len(parts) == 2:
+                    dia = parts[0].zfill(2)
+                    mes_str = parts[1].lower()
+                    mes = meses_es.get(mes_str, '01')
+                    
+                    # Determinar año basado en el mes
+                    # Si es diciembre y estamos en enero, es año anterior
+                    # Si es enero y estamos en diciembre, es año siguiente
+                    now = datetime.now()
+                    anio = now.year
+                    
+                    if mes == '12' and now.month == 1:
+                        anio = now.year - 1
+                    elif mes == '01' and now.month == 12:
+                        anio = now.year + 1
+                    
+                    fecha_str_formatted = f"{anio}-{mes}-{dia}"
+                    try:
+                        fecha = datetime.strptime(fecha_str_formatted, "%Y-%m-%d").date()
+                    except:
+                        pass
+            
+            # Si no se pudo parsear con el formato especial, intentar pandas
+            if not fecha:
+                try:
+                    fecha = pd.to_datetime(fecha_raw, errors='coerce').date()
+                except:
+                    pass
+            
+            if not fecha or pd.isna(fecha):
+                errors.append(f"Fila {idx+2}: Fecha inválida '{fecha_raw}'")
+                continue
+            
+            # Extraer descripción
+            descripcion = str(row[desc_col]).strip()
+            if descripcion == 'nan' or not descripcion or descripcion == '':
+                continue
+            
+            # Ignorar filas que contienen totales o notas
+            if any(word in descripcion.lower() for word in ['subtotal', 'notas:', 'información referencial']):
+                continue
+            
+            # Determinar monto y tipo - manejar valores vacíos, NaN, y strings vacíos
+            cargo = 0
+            abono = 0
+            
+            if cargo_col:
+                cargo_val = row[cargo_col]
+                if pd.notna(cargo_val) and str(cargo_val).strip() != '':
+                    try:
+                        # Eliminar separadores de miles (punto) y convertir
+                        cargo_str = str(cargo_val).replace('.', '').replace(',', '.').strip()
+                        if cargo_str:
+                            cargo = float(cargo_str)
+                    except:
+                        pass
+            
+            if abono_col:
+                abono_val = row[abono_col]
+                if pd.notna(abono_val) and str(abono_val).strip() != '':
+                    try:
+                        # Eliminar separadores de miles (punto) y convertir
+                        abono_str = str(abono_val).replace('.', '').replace(',', '.').strip()
+                        if abono_str:
+                            abono = float(abono_str)
+                    except:
+                        pass
+            
+            # Determinar tipo de transacción
+            if cargo > 0:
+                amount = cargo
+                trans_type = 2  # gasto
+            elif abono > 0:
+                amount = abono
+                trans_type = 1  # ingreso
+            else:
+                # Ambos están vacíos o en cero, saltar
+                continue
+            
+            # Verificar si ya existe una transacción con los mismos datos (evitar duplicados)
+            descripcion_corta = descripcion[:200]
+            
+            # Buscar en transacciones confirmadas
+            existe_confirmada = db.query(models.Transaction).filter(
+                models.Transaction.user_id == user_id,
+                models.Transaction.date == fecha,
+                models.Transaction.amount == amount,
+                models.Transaction.description == descripcion_corta
+            ).first()
+            
+            # Buscar en transacciones pendientes
+            existe_pendiente = db.query(models.PendingTransaction).filter(
+                models.PendingTransaction.user_id == user_id,
+                models.PendingTransaction.date == fecha,
+                models.PendingTransaction.amount == amount,
+                models.PendingTransaction.description == descripcion_corta
+            ).first()
+            
+            # Si ya existe, saltar esta transacción
+            if existe_confirmada or existe_pendiente:
+                duplicates_skipped += 1
+                continue
+            
+            # Intentar auto-categorizar
+            category_id = apply_import_rules(db, user_id, descripcion)
+            auto_cat = category_id is not None
+            
+            if auto_cat:
+                auto_categorized += 1
+            
+            # Crear transacción pendiente
+            pending = models.PendingTransaction(
+                user_id=user_id,
+                category_id=category_id,
+                amount=amount,
+                type=trans_type,
+                description=descripcion_corta,
+                raw_description=descripcion,
+                date=fecha,
+                auto_categorized=auto_cat,
+                import_batch_id=batch_id
+            )
+            
+            db.add(pending)
+            pending_transactions.append(pending)
+            total_imported += 1
+            
+        except Exception as e:
+            # Ignorar filas con errores
+            continue
+    
+    db.commit()
+    
+    # Refrescar para obtener IDs
+    for p in pending_transactions:
+        db.refresh(p)
+    
+    # Convertir objetos SQLAlchemy a dicts para serialización
+    from . import schemas
+    pending_dicts = [schemas.PendingTransaction.model_validate(p) for p in pending_transactions]
+    
+    return {
+        "total_imported": total_imported,
+        "auto_categorized": auto_categorized,
+        "needs_review": total_imported - auto_categorized,
+        "duplicates_skipped": duplicates_skipped,
+        "batch_id": batch_id,
+        "pending_transactions": pending_dicts
+    }
